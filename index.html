@@ -333,7 +333,7 @@
     z-index: 10;
     border-radius: 1px;
     pointer-events: none;
-    transition: left 1s linear;
+    transition: left 0.3s linear;
   }
 
   #globalNowLine .now-cap {
@@ -347,6 +347,114 @@
   }
   #globalNowLine .now-cap.top { top: -4px; }
   #globalNowLine .now-cap.bottom { bottom: -4px; }
+
+  #globalNowLine.draggable {
+    pointer-events: auto;
+    cursor: grab;
+  }
+  #globalNowLine.draggable::before {
+    content: '';
+    position: absolute;
+    left: -8px;
+    width: 18px;
+    height: 100%;
+    cursor: grab;
+  }
+  #globalNowLine.dragging,
+  #globalNowLine.dragging::before {
+    cursor: grabbing;
+  }
+
+  #globalNowLine.dimmed {
+    opacity: 0.35;
+    box-shadow: none;
+  }
+  #globalNowLine.dimmed .now-cap {
+    opacity: 0.35;
+    box-shadow: none;
+  }
+
+  #draggedNowLine {
+    position: absolute;
+    top: 0;
+    width: 2px;
+    height: 100%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent-glow), 0 0 18px var(--accent-glow);
+    z-index: 11;
+    border-radius: 1px;
+    pointer-events: none;
+    display: none;
+    cursor: grab;
+  }
+  #draggedNowLine.pinned {
+    pointer-events: auto;
+  }
+  #draggedNowLine.pinned::before {
+    content: '';
+    position: absolute;
+    left: -8px;
+    width: 18px;
+    height: 100%;
+    cursor: grab;
+  }
+  #draggedNowLine.dragging-line,
+  #draggedNowLine.dragging-line::before {
+    cursor: grabbing;
+  }
+  #draggedNowLine .now-cap {
+    position: absolute;
+    left: -3px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent-glow);
+  }
+  #draggedNowLine .now-cap.top { top: -4px; }
+  #draggedNowLine .now-cap.bottom { bottom: -4px; }
+
+  .drag-overlay {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    z-index: 5;
+    pointer-events: none;
+  }
+  .drag-overlay.future {
+    background: rgba(80, 200, 120, 0.12);
+    border-left: 1px solid rgba(80, 200, 120, 0.25);
+    border-right: 1px solid rgba(80, 200, 120, 0.25);
+  }
+  .drag-overlay.past {
+    background: rgba(220, 80, 40, 0.12);
+    border-left: 1px solid rgba(220, 80, 40, 0.25);
+    border-right: 1px solid rgba(220, 80, 40, 0.25);
+  }
+
+  .drag-duration {
+    position: absolute;
+    z-index: 12;
+    background: rgba(20, 24, 40, 0.9);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+    display: none;
+    transform: translateX(-50%);
+    letter-spacing: 0.5px;
+  }
+  .drag-duration.future {
+    color: #50C878;
+    border: 1px solid rgba(80, 200, 120, 0.4);
+  }
+  .drag-duration.past {
+    color: #DC5028;
+    border: 1px solid rgba(220, 80, 40, 0.4);
+  }
 
   @media (max-width: 600px) {
     .zone-name { font-size: 16px; font-weight: 500; }
@@ -400,10 +508,15 @@
 </div>
 
 <div class="zones" id="zones">
-  <div id="globalNowLine">
+  <div id="globalNowLine" class="draggable">
     <div class="now-cap top"></div>
     <div class="now-cap bottom"></div>
   </div>
+  <div id="draggedNowLine">
+    <div class="now-cap top"></div>
+    <div class="now-cap bottom"></div>
+  </div>
+  <div class="drag-duration" id="dragDuration"></div>
 </div>
 
 <script>
@@ -707,8 +820,12 @@ function formatDate(date) {
 function buildUI() {
   const container = document.getElementById('zones');
   const globalLine = document.getElementById('globalNowLine');
+  const draggedLine = document.getElementById('draggedNowLine');
+  const dragDuration = document.getElementById('dragDuration');
   container.innerHTML = '';
   container.appendChild(globalLine);
+  container.appendChild(draggedLine);
+  container.appendChild(dragDuration);
 
   const homeOffset = getUtcOffsetHours(HOME_TZ);
 
@@ -874,7 +991,7 @@ buildUI();
 updateTimes();
 drawAllTimelines();
 
-setInterval(updateTimes, 1000);
+setInterval(() => updateTimes(), 1000);
 setInterval(drawAllTimelines, 60000);
 
 let resizeTimeout;
@@ -929,6 +1046,268 @@ document.getElementById('toggleHide').addEventListener('click', () => {
   document.getElementById('toggleCollapse').classList.toggle('active', collapseOthers);
   rebuild();
 });
+
+// --- Drag now-indicator feature ---
+let isDragging = false;
+let dragStartX = 0;
+let dragNowLineOrigX = 0;
+let dragActive = false;
+let dragJustPinned = false;
+let dragHourOffset = 0; // hours offset from now for dragged position
+let dragPinnedTime = null; // absolute timestamp when pinned, for stable clock display
+
+function getCanvasInfo() {
+  const homeCanvas = document.querySelector(`.gradient-bar[data-tz="${HOME_TZ}"] canvas`);
+  const zonesEl = document.getElementById('zones');
+  if (!homeCanvas || !zonesEl) return null;
+  const canvasRect = homeCanvas.getBoundingClientRect();
+  const zonesRect = zonesEl.getBoundingClientRect();
+  return { canvasRect, zonesRect, canvasLeft: canvasRect.left - zonesRect.left, canvasWidth: canvasRect.width };
+}
+
+function getDragDirection(nowLineX, draggedLineX) {
+  return draggedLineX >= nowLineX ? 'future' : 'past';
+}
+
+function updateDragOverlays(nowLineX, draggedLineX) {
+  document.querySelectorAll('.drag-overlay').forEach(el => el.remove());
+
+  const bars = document.querySelectorAll('.gradient-bar');
+  const zonesEl = document.getElementById('zones');
+  const zonesRect = zonesEl.getBoundingClientRect();
+  const direction = getDragDirection(nowLineX, draggedLineX);
+
+  const leftX = Math.min(nowLineX, draggedLineX);
+  const rightX = Math.max(nowLineX, draggedLineX);
+
+  bars.forEach(bar => {
+    const zone = bar.closest('.zone');
+    if (zone && zone.classList.contains('hidden-zone')) return;
+    const barRect = bar.getBoundingClientRect();
+    const barLeft = barRect.left - zonesRect.left;
+    const barRight = barLeft + barRect.width;
+
+    const oLeft = Math.max(leftX, barLeft);
+    const oRight = Math.min(rightX, barRight);
+    if (oRight <= oLeft) return;
+
+    const overlay = document.createElement('div');
+    overlay.className = `drag-overlay ${direction}`;
+    overlay.style.left = `${oLeft}px`;
+    overlay.style.width = `${oRight - oLeft}px`;
+    overlay.style.top = `${barRect.top - zonesRect.top}px`;
+    overlay.style.height = `${barRect.height}px`;
+    zonesEl.appendChild(overlay);
+  });
+}
+
+function updateDragDuration(nowLineX, draggedLineX) {
+  const info = getCanvasInfo();
+  if (!info) return;
+  const durationEl = document.getElementById('dragDuration');
+  const pixelDiff = draggedLineX - nowLineX;
+  const hourDiff = (pixelDiff / info.canvasWidth) * 24;
+  dragHourOffset = hourDiff;
+  const direction = getDragDirection(nowLineX, draggedLineX);
+  const sign = hourDiff >= 0 ? '+' : '-';
+  const absHours = Math.abs(hourDiff);
+  const h = Math.floor(absHours);
+  const m = Math.round((absHours - h) * 60);
+  durationEl.textContent = `${sign}${h}h:${m.toString().padStart(2, '0')}m`;
+  durationEl.className = `drag-duration ${direction}`;
+  durationEl.style.display = 'block';
+
+  const midX = (nowLineX + draggedLineX) / 2;
+  durationEl.style.left = `${midX}px`;
+  durationEl.style.top = '0px';
+}
+
+function updateDraggedClocks() {
+  if (!dragActive && !isDragging) return;
+  for (const city of CITIES) {
+    let draggedDate;
+    if (dragPinnedTime !== null) {
+      // Use stable pinned timestamp for consistent display
+      draggedDate = new Date(dragPinnedTime.toLocaleString('en-US', { timeZone: city.tz }));
+    } else {
+      // During active drag, use offset
+      const now = getNowInTz(city.tz);
+      draggedDate = new Date(now.getTime() + dragHourOffset * 3600000);
+    }
+    const timeEl = document.querySelector(`.zone-clock-time[data-tz="${city.tz}"]`);
+    if (timeEl) timeEl.innerHTML = formatTime(draggedDate);
+  }
+}
+
+function clearDragState() {
+  dragActive = false;
+  dragHourOffset = 0;
+  dragPinnedTime = null;
+  document.querySelectorAll('.drag-overlay').forEach(el => el.remove());
+  const draggedLine = document.getElementById('draggedNowLine');
+  const durationEl = document.getElementById('dragDuration');
+  const nowLine = document.getElementById('globalNowLine');
+  draggedLine.style.display = 'none';
+  draggedLine.classList.remove('pinned', 'dragging-line');
+  durationEl.style.display = 'none';
+  nowLine.classList.remove('dimmed');
+  // Restore real clocks
+  updateTimesReal();
+}
+
+// Keep original updateTimes for restoring
+const origUpdateTimes = updateTimes;
+function updateTimesReal() { origUpdateTimes(); }
+
+updateTimes = function() {
+  // Always update the now line position
+  const homeNow = getNowInTz(HOME_TZ);
+  const currentHour = homeNow.getHours() + homeNow.getMinutes() / 60 + homeNow.getSeconds() / 3600;
+  const nowPct = currentHour / 24;
+  const homeCanvas = document.querySelector(`.gradient-bar[data-tz="${HOME_TZ}"] canvas`);
+  const zonesEl = document.getElementById('zones');
+  const nowLine = document.getElementById('globalNowLine');
+  if (homeCanvas && zonesEl && nowLine) {
+    const canvasRect = homeCanvas.getBoundingClientRect();
+    const zonesRect = zonesEl.getBoundingClientRect();
+    const xPos = canvasRect.left - zonesRect.left + canvasRect.width * nowPct;
+    nowLine.style.left = `${xPos}px`;
+  }
+
+  if (dragActive || isDragging) {
+    // Show dragged time on clocks, keep now line dimmed
+    nowLine.classList.add('dimmed');
+    const draggedLine = document.getElementById('draggedNowLine');
+    const nowX = parseFloat(nowLine.style.left);
+    const draggedX = parseFloat(draggedLine.style.left);
+    if (!isNaN(nowX) && !isNaN(draggedX)) {
+      updateDragOverlays(nowX, draggedX);
+      updateDragDuration(nowX, draggedX);
+    }
+    updateDraggedClocks();
+  } else {
+    // Normal mode: show real clocks
+    for (const city of CITIES) {
+      const now = getNowInTz(city.tz);
+      const timeEl = document.querySelector(`.zone-clock-time[data-tz="${city.tz}"]`);
+      if (timeEl) timeEl.innerHTML = formatTime(now);
+    }
+  }
+};
+
+const globalLine = document.getElementById('globalNowLine');
+
+function startDrag(e, fromDraggedLine) {
+  isDragging = true;
+  dragStartX = e.clientX;
+  document.body.style.userSelect = 'none';
+  document.body.style.webkitUserSelect = 'none';
+
+  const draggedLine = document.getElementById('draggedNowLine');
+
+  if (fromDraggedLine) {
+    // Re-drag from the pinned dragged line position
+    dragNowLineOrigX = parseFloat(draggedLine.style.left) || 0;
+    draggedLine.classList.add('dragging-line');
+    draggedLine.classList.remove('pinned');
+  } else {
+    // Fresh drag from now line
+    dragNowLineOrigX = parseFloat(globalLine.style.left) || 0;
+    globalLine.classList.add('dragging');
+  }
+
+  globalLine.classList.add('dimmed');
+  globalLine.style.transition = 'none';
+  draggedLine.style.display = 'block';
+  draggedLine.style.left = `${dragNowLineOrigX}px`;
+  dragActive = false;
+  dragPinnedTime = null;
+
+  e.preventDefault();
+  e.stopPropagation();
+}
+
+globalLine.addEventListener('mousedown', (e) => {
+  if (dragActive) return;
+  startDrag(e, false);
+});
+
+// Allow re-drag from pinned dragged line
+document.getElementById('draggedNowLine').addEventListener('mousedown', (e) => {
+  if (!dragActive) return;
+  startDrag(e, true);
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!isDragging) return;
+  const info = getCanvasInfo();
+  if (!info) return;
+
+  const dx = e.clientX - dragStartX;
+  let newX = dragNowLineOrigX + dx;
+  newX = Math.max(info.canvasLeft, Math.min(info.canvasLeft + info.canvasWidth, newX));
+
+  // Shift key: snap to nearest absolute 15-minute mark (1:00, 1:15, 1:30, 1:45)
+  if (e.shiftKey) {
+    // Calculate what absolute home time this pixel represents
+    const homeNow = getNowInTz(HOME_TZ);
+    const currentHour = homeNow.getHours() + homeNow.getMinutes() / 60 + homeNow.getSeconds() / 3600;
+    const pxToHour = ((newX - info.canvasLeft) / info.canvasWidth) * 24;
+    // Snap to nearest 0.25h (15 min)
+    const snappedHour = Math.round(pxToHour * 4) / 4;
+    newX = info.canvasLeft + (snappedHour / 24) * info.canvasWidth;
+    newX = Math.max(info.canvasLeft, Math.min(info.canvasLeft + info.canvasWidth, newX));
+  }
+
+  const draggedLine = document.getElementById('draggedNowLine');
+  draggedLine.style.left = `${newX}px`;
+
+  const nowX = parseFloat(globalLine.style.left) || dragNowLineOrigX;
+  updateDragOverlays(nowX, newX);
+  updateDragDuration(nowX, newX);
+  updateDraggedClocks();
+});
+
+document.addEventListener('mouseup', (e) => {
+  if (!isDragging) return;
+  isDragging = false;
+  globalLine.classList.remove('dragging');
+  globalLine.style.transition = 'left 0.3s linear';
+  document.body.style.userSelect = '';
+  document.body.style.webkitUserSelect = '';
+
+  const draggedLine = document.getElementById('draggedNowLine');
+  draggedLine.classList.remove('dragging-line');
+  const draggedX = parseFloat(draggedLine.style.left);
+  const nowX = parseFloat(globalLine.style.left) || dragNowLineOrigX;
+
+  // If barely moved, treat as click → don't pin
+  if (Math.abs(draggedX - nowX) < 3) {
+    clearDragState();
+    return;
+  }
+
+  // Pin the dragged position — store absolute time for stable clocks
+  dragActive = true;
+  dragPinnedTime = new Date(Date.now() + dragHourOffset * 3600000);
+  draggedLine.classList.add('pinned');
+  dragJustPinned = true;
+  setTimeout(() => { dragJustPinned = false; }, 50);
+});
+
+// Click anywhere on zones to clear pinned state
+document.getElementById('zones').addEventListener('click', (e) => {
+  if (!dragActive || dragJustPinned) return;
+  if (e.target.closest('#globalNowLine')) return;
+  clearDragState();
+});
+
+// Also clear drag state on rebuild
+const origRebuild = rebuild;
+rebuild = function() {
+  clearDragState();
+  origRebuild();
+};
 </script>
 </body>
 </html>
